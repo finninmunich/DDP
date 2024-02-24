@@ -1690,7 +1690,72 @@ class PixelTransformerDecoder(BaseModule):
             predictions_class.append(outputs_class)
 
         return predictions_bins, predictions_mask, predictions_class
+@TRANSFORMER_LAYER_SEQUENCE.register_module()
+class DetrTransformerEncoderWithSkipConnection(TransformerLayerSequence):
+    """TransformerEncoder of DETR.
 
+    Args:
+        post_norm_cfg (dict): Config of last normalization layer. Default：
+            `LN`. Only used when `self.pre_norm` is `True`
+    """
+
+    def __init__(self, *args, post_norm_cfg=dict(type='LN'), **kwargs):
+        super(DetrTransformerEncoderWithSkipConnection, self).__init__(*args, **kwargs)
+        if post_norm_cfg is not None:
+            self.post_norm = build_norm_layer(
+                post_norm_cfg, self.embed_dims)[1] if self.pre_norm else None
+        else:
+            assert not self.pre_norm, f'Use prenorm in ' \
+                                      f'{self.__class__.__name__},' \
+                                      f'Please specify post_norm_cfg'
+            self.post_norm = None
+        self.fc1 = nn.Linear(in_features=512, out_features=256)
+        self.fc2 = nn.Linear(in_features=512, out_features=256)
+        self.fc3 = nn.Linear(in_features=512, out_features=256)
+
+    def forward(self,
+                query,
+                key,
+                value,
+                query_pos=None,
+                key_pos=None,
+                attn_masks=None,
+                query_key_padding_mask=None,
+                key_padding_mask=None,
+                **kwargs):
+        """Forward function for `TransformerCoder`.
+
+        Returns:
+            Tensor: forwarded results with shape [num_query, bs, embed_dims].
+        """
+        outs = []
+        assert len(self.layers) == 6
+        for i, layer in enumerate(self.layers):
+            if i < 3:
+                outs.append(query)
+            else:
+                if i == 3:
+                    query = torch.cat([query, outs[-1]], dim=-1)
+                    query = self.fc1(query)
+                if i == 4:
+                    query = torch.cat([query, outs[-2]], dim=-1)
+                    query = self.fc2(query)
+                if i == 5:
+                    query = torch.cat([query, outs[-3]], dim=-1)
+                    query = self.fc3(query)
+            query = layer(
+                query,
+                key,
+                value,
+                query_pos=query_pos,
+                key_pos=key_pos,
+                attn_masks=attn_masks,
+                query_key_padding_mask=query_key_padding_mask,
+                key_padding_mask=key_padding_mask,
+                **kwargs)
+        if self.post_norm is not None:
+            query = self.post_norm(query)
+        return query
 # @TRANSFORMER.register_module()
 # class PixelMSDeTransformer(BaseModule):
 #     """

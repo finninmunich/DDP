@@ -5,8 +5,8 @@ reduce_beams: 32
 load_dim: 5
 use_dim: 5
 load_augmented: null
-future_frames: 0
-receptive_field: 1
+receptive_field: "not valid" # for overwriting
+future_frames: "not valid" # for overwriting
 point_cloud_range: [ -51.2, -51.2, -5.0, 51.2, 51.2, 3.0 ]
 voxel_size: [ 0.1, 0.1, 0.2 ]
 image_size: [ 256, 704 ]

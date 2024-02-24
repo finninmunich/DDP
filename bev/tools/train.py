@@ -15,7 +15,8 @@ from mmdet3d.apis import train_model
 from mmdet3d.datasets import build_dataset
 from mmdet3d.models import build_model
 from mmdet3d.utils import get_root_logger, convert_sync_batchnorm, recursive_eval
-
+import warnings
+warnings.filterwarnings('ignore')
 
 def main():
     print(f"initializing distributed environment for rank {dist.local_rank()}")

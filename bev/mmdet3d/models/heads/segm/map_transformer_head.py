@@ -1,9 +1,11 @@
+import warnings
+from typing import List, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import warnings
+
 from mmdet3d.models.builder import HEADS
-from typing import List, Tuple
 
 try:
     from mmcv.ops.multi_scale_deform_attn import MultiScaleDeformableAttention
@@ -95,7 +97,7 @@ class BEVGridTransform(nn.Module):
 
 
 @HEADS.register_module()
-class DeformableHeadWithTime(nn.Module):
+class MapTransformerHead(nn.Module):
     """Implements the DeformableEncoder.
     Args:
         num_feature_levels (int): Number of feature maps from FPN:
@@ -111,8 +113,7 @@ class DeformableHeadWithTime(nn.Module):
                  grid_transform,
                  in_channels=256,
                  seg_conv_kernel=1,
-                 receptive_field=1,
-                 future_frames=2,
+                 seq_length=1,
                  ):
         super().__init__()
 
@@ -127,15 +128,15 @@ class DeformableHeadWithTime(nn.Module):
         assert num_feats * 2 == self.embed_dims, 'embed_dims should' \
                                                  f' be exactly 2 times of num_feats. Found {self.embed_dims}' \
                                                  f' and {num_feats}.'
-        self.seq_length = receptive_field + future_frames
+        self.seq_length = seq_length
         self.classes = classes
         self.loss = loss
         self.transform = BEVGridTransform(**grid_transform)
 
         if seg_conv_kernel == 1:
-            self.conv_seg = nn.Conv2d(in_channels, len(classes) * self.seq_length, kernel_size=1)
+            self.conv_seg = nn.Conv2d(in_channels, len(classes), kernel_size=1)
         else:
-            self.conv_seg = nn.Conv2d(in_channels, len(classes) * self.seq_length, kernel_size=3, padding=1)
+            self.conv_seg = nn.Conv2d(in_channels, len(classes), kernel_size=3, padding=1)
 
         self.init_weights()
 
@@ -178,7 +179,7 @@ class DeformableHeadWithTime(nn.Module):
     def forward(self, inputs, times, target=None):
 
         mlvl_feats = inputs[-self.num_feature_levels:]  # the input is [feat], so this step is just for unpacking
-        # shape of mlvl_feats (bs,tmp_channels,h,w)
+        # shape of mlvl_feats (bs,seq_len,tmp_channels,h,w)
         # bev transform
         mlvl_feats = [self.transform(feat) for feat in mlvl_feats]  # from h,w -> bev_h, bev_w
         feat_flatten = []
@@ -195,14 +196,14 @@ class DeformableHeadWithTime(nn.Module):
             lvl_pos_embed = pos_embed
             lvl_pos_embed_flatten.append(lvl_pos_embed)
             feat_flatten.append(feat)
-        feat_flatten = torch.cat(feat_flatten, 1)  # (bs, H*W, embed_dims)
-        lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)  # (bs, H*W, embed_dims)
+        feat_flatten = torch.cat(feat_flatten, 1) #(bs, H*W, embed_dims)
+        lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1) #(bs, H*W, embed_dims)
         spatial_shapes = torch.as_tensor(
-            spatial_shapes, dtype=torch.long, device=feat_flatten.device)  # (H,W)
+            spatial_shapes, dtype=torch.long, device=feat_flatten.device) #(H,W)
         level_start_index = torch.cat((spatial_shapes.new_zeros(
             (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
 
-        reference_points = self.get_reference_points(spatial_shapes, device=feat.device)  # (1, H*W, 1, 2)
+        reference_points = self.get_reference_points(spatial_shapes, device=feat.device) #(1, H*W, 1, 2)
         feat_flatten = feat_flatten.permute(1, 0, 2)  # (H*W, bs, embed_dims)
         lvl_pos_embed_flatten = lvl_pos_embed_flatten.permute(1, 0, 2)  # (H*W, bs, embed_dims)
         memory = self.encoder(

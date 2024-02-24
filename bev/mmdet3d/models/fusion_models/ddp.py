@@ -62,9 +62,10 @@ class DDP(BEVFusion):
             noise_schedule='cosine',
             diffusion='ddim',
             threshold=0.5,
-            feat_channels=512,
+            feat_channels=256,
             tmp_channels=256,
-            seq_length=1,
+            receptive_field=1,
+            future_frames=2,
             **kwargs,
     ) -> None:
         super(DDP, self).__init__(**kwargs)
@@ -76,9 +77,9 @@ class DDP(BEVFusion):
         self.time_difference = time_difference
         self.sample_range = sample_range
         self.num_classes = 6
-        self.tmp_channels = tmp_channels
-        self.feat_channels = feat_channels
-        self.seq_length = seq_length
+        self.tmp_channels = tmp_channels # dimension of embedded gt
+        self.feat_channels = feat_channels# dimension of bev feature
+        self.seq_length = receptive_field + future_frames
         self.embedding_table = nn.Embedding(self.num_classes + 1, self.tmp_channels)
         self.threshold = threshold
 

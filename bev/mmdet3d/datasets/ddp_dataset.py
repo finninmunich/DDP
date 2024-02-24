@@ -174,7 +174,7 @@ class DDPDataset(Custom3DDataset):
                 use_external=False,
             )
         self.receptive_field = receptive_field
-        self.n_future = future_frames
+        self.future_frames = future_frames
         self.sequence_length = receptive_field + future_frames
         self.data_infos.sort(key=lambda x: (x['scene_token'], x['timestamp']))
         self.visualization = visualization
@@ -218,7 +218,7 @@ class DDPDataset(Custom3DDataset):
 
         # generate the future
         future_indices = []
-        for t in range(1, self.n_future + 1):
+        for t in range(1, self.future_frames + 1):
             index_t = index + t
             if index_t < len(self.data_infos) and self.data_infos[index_t]['scene_token'] == current_scene_token:
                 future_indices.append(index_t)

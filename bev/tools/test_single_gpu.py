@@ -20,7 +20,8 @@ from mmdet3d.utils import recursive_eval
 import sys
 import os
 import time
-
+import warnings
+warnings.filterwarnings('ignore')
 
 # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 def parse_args():
