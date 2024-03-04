@@ -1,6 +1,6 @@
 data:
-  samples_per_gpu: 8
-future_frames: 2
+  samples_per_gpu: 4
+future_frames: 4
 receptive_field: 1
 model:
   type: DDP

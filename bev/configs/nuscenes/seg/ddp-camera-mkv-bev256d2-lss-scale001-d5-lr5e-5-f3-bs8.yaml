@@ -1,9 +1,9 @@
 data:
-  samples_per_gpu: 8
+  samples_per_gpu: 1
 future_frames: 2
 receptive_field: 1
 model:
-  type: DDP
+  type: DDP_MKV
   feat_channels: 256
   bit_scale: 0.01
   timesteps: 3
@@ -82,37 +82,16 @@ model:
       scale_factor: 2
   heads:
     map:
-      type: DeformableHeadWithTime
-      in_channels: 256 # dimension of fused features
-      num_feature_levels: 1
-      receptive_field: ${receptive_field}
-      future_frames: ${future_frames}
-      encoder:
-        type: DetrTransformerEncoder
-        num_layers: 5
-        transformerlayers:
-          type: BaseTransformerLayer
-          use_time_mlp: True
-          attn_cfgs:
-            type: MultiScaleDeformableAttention
-            embed_dims: 256
-            num_levels: 1
-            num_heads: 8
-            dropout: 0.0
-          ffn_cfgs:
-            type: FFN
-            embed_dims: 256
-            feedforward_channels: 1024
-            num_fcs: 2
-            act_cfg:
-              type: GELU
-            ffn_drop: 0.0
-          operation_order: ['self_attn', 'norm', 'ffn', 'norm']
-      positional_encoding:
-        type: SinePositionalEncoding
-        num_feats: 128
-        normalize: True
-        offset: -0.5
+      type: SpaceTimeUnet
+      dim: 64
+      channels: 3
+      dim_mult: (1, 2, 4, 8)
+      resnet_block_depths: (1, 1, 1, 2)
+      temporal_compression: (false, false, false, true)
+      self_attns: (false, false, false, true)
+      condition_on_timestep: true
+      attn_pos_bias: false
+      flash_attn: false
 
 optimizer:
   type: AdamW

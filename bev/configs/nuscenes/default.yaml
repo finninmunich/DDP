@@ -318,7 +318,7 @@ data:
     receptive_field: ${receptive_field}
     future_frames: ${future_frames}
     camera_index: ${camera_index}
-    #visualization: 3-cam-backleft-backright
+    visualization: finn-0224-2
     #filter_invalid_sample: true
 
   test:
@@ -335,7 +335,7 @@ data:
     receptive_field: ${receptive_field}
     future_frames: ${future_frames}
     camera_index: ${camera_index}
-    #visualization: 3-cam-backleft-backright
+    visualization: finn-0224-2
     #filter_invalid_sample: true
 
 evaluation:

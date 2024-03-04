@@ -97,7 +97,7 @@ class BEVGridTransform(nn.Module):
 
 
 @HEADS.register_module()
-class MapTransformerHead(nn.Module):
+class MapTransformerHeadV1(nn.Module):
     """Implements the DeformableEncoder.
     Args:
         num_feature_levels (int): Number of feature maps from FPN:
