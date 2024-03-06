@@ -2,17 +2,14 @@ import math
 
 import torch
 from einops import rearrange, repeat
-from mmcv.cnn import ConvModule
 from mmcv.runner import force_fp32
 from torch import nn
 from torch.special import expm1
 
 from mmdet3d.models import FUSIONMODELS
 from .bevfusion import BEVFusion
-
-__all__ = ["DDP_MKV"]
-
 from ...ops.norm import resize
+__all__ = ["DDP_MKV"]
 
 
 def log(t, eps=1e-20):
@@ -64,6 +61,7 @@ class DDP_MKV(BEVFusion):
             threshold=0.5,
             feat_channels=256,
             tmp_channels=256,
+            time_cond_channels=256,
             receptive_field=1,
             future_frames=2,
             **kwargs,
@@ -79,10 +77,10 @@ class DDP_MKV(BEVFusion):
         self.num_classes = 6
         self.tmp_channels = tmp_channels  # dimension of embedded gt
         self.feat_channels = feat_channels  # dimension of bev feature
+        self.time_cond_channels = time_cond_channels
         self.seq_length = receptive_field + future_frames
         self.embedding_table = nn.Embedding(self.num_classes + 1, self.tmp_channels)
         self.threshold = threshold
-
         print("sample range:", sample_range)
         print("timesteps: {}, randsteps: {}".format(timesteps, randsteps))
 
@@ -93,7 +91,7 @@ class DDP_MKV(BEVFusion):
         else:
             raise ValueError(f'invalid noise schedule {noise_schedule}')
         # time embeddings
-        time_dim = self.tmp_channels * 4  # 1024
+        time_dim = self.time_cond_channels  # 1024
         sinu_pos_emb = LearnedSinusoidalPosEmb(learned_sinusoidal_dim)
         fourier_dim = learned_sinusoidal_dim + 1
 
@@ -199,45 +197,47 @@ class DDP_MKV(BEVFusion):
                     multi_factor = multi_factor.unsqueeze(2)  # (1,6,1,1,1)
                     multi_factor = multi_factor.repeat(batch, 1, seq_len, 1, 1)  # (bs,num_classes,seq_length,1,1)
                     # switch axis
-                    gt_masks_bev = gt_masks_bev.permute(0, 2, 1, 3, 4)  # (bs,num_classes,seq_length,h,w)
+                    gt_masks_bev = gt_masks_bev.permute(0, 2, 1, 3, 4).contiguous()  # (bs,num_classes,seq_length,h,w)
                     gt_down = gt_masks_bev * multi_factor
                     gt_down = gt_down.view(batch, self.num_classes * seq_len, h_bev, w_bev)
+                    # TODO: the following steps is previous used for concatenation gt_down and mask
+
                     gt_down = resize(gt_down.float(), size=(h, w), mode="nearest").to(
                         gt_masks_bev.dtype)  # -> (bs,seq_len*6,128,128)
+
                     # feed in to nn.embedding -> (bs,seq_len*6,128,128,256)
                     # gt_down = self.embedding_table(gt_down).mean(dim=1).permute(0, 3, 1, 2)  # class embedding and averate
                     # the shape of self.embedding_table(gt_down) is (bs,num_class*seq_length,h,w,tmp_channels)
+
                     gt_down = self.embedding_table(gt_down).view(batch, self.num_classes, seq_len, h, w,
                                                                  self.tmp_channels)
                     # (bs,seq_len,num_class,128,128,tmp_channels)
                     # the shape of gt_down.mean(dim=2) is (bs,seq_len,128,128,tmp_channels)
-                    gt_down = gt_down.mean(dim=1).permute(0, 4, 1, 2, 3)  # (bs,tmp_channels,seq_len,128,128)
+                    gt_down = gt_down.mean(dim=1).permute(0, 4, 1, 2,
+                                                          3).contiguous()  # (bs,tmp_channels,seq_len,128,128)
                     # after embedding, its shape becomes (4,256,128,128)
                     gt_down = (torch.sigmoid(gt_down) * 2 - 1) * self.bit_scale
-                    gt_down = gt_down.reshape(batch, self.tmp_channels * seq_len, h, w).contiguous()
-                    print(f"the shape of embedded gt_down is {gt_down.shape}")
+                    # shape of gt_down (bs,tmp_channels,seq_len,bev_h,bev_w)
                     # sample timesteps
 
                     times = torch.zeros((batch,), device=device) \
-                        .float().uniform_(self.sample_range[0], self.sample_range[1])
+                        .float().uniform_(self.sample_range[0], self.sample_range[1])  # (batch,)
                     # random noise
-
                     noise = torch.randn_like(gt_down)
-                    noise_level = self.log_snr(times)
+                    noise_level = self.log_snr(times)  # (batch,)
                     padded_noise_level = self.right_pad_dims_to(img, noise_level, offset=1)
                     alpha, sigma = log_snr_to_alpha_sigma(padded_noise_level)
+                    alpha = alpha.unsqueeze(-1)
+                    sigma = sigma.unsqueeze(-1)
                     noised_gt = alpha * gt_down + sigma * noise
 
-                    # conditional input
-                    feat = torch.cat([x[0], noised_gt], dim=1)
-                    # shape of x is (bs,feat_channels,h,w)
-                    # shape of noised_gt is (bs,tmp_channels,h,w)
                     input_times = self.time_mlp(noise_level)
+                    bev_feat = x[0]
                     # shape of input_times is (bs,1024)
                     # In the original paper, the author use x_t and t to predict the noise of X_0!! not the noise of x_t-1
                     # so here we also predict the GROUND_TRUTH --> we can then calculate the noise of X_0 (reparameterization trick)
                     # the reason why we do this is that we don't use MSEloss to predict the noise directly.
-                    losses = head([feat], input_times, gt_masks_bev)
+                    losses = head(x=noised_gt, cond=bev_feat, embed_timesteps=input_times, target=gt_masks_bev)
                     # one thing is different here, we use the decoder to predict the gt_masks
                 else:
                     raise ValueError(f"unsupported head: {type}")
@@ -287,11 +287,10 @@ class DDP_MKV(BEVFusion):
 
         x = repeat(x[0], 'b c h w -> (r b) c h w', r=self.randsteps)
         outs = []
-        mask_t = torch.randn((self.randsteps, self.seq_length * self.tmp_channels, h, w), device=device)
+        # for now this is hard coding
+        mask_t = torch.randn((self.randsteps, self.tmp_channels, self.seq_length, h, w), device=device)
         for idx, (times_now, times_next) in enumerate(time_pairs):
-            feat = torch.cat([x, mask_t], dim=1)
             br = x.shape[0]
-            feat = self.transform(feat)
 
             log_snr = self.log_snr(times_now)
             log_snr_next = self.log_snr(times_next)
@@ -300,10 +299,9 @@ class DDP_MKV(BEVFusion):
             padded_log_snr_next = self.right_pad_dims_to(mask_t, log_snr_next)
             alpha, sigma = log_snr_to_alpha_sigma(padded_log_snr)
             alpha_next, sigma_next = log_snr_to_alpha_sigma(padded_log_snr_next)
-
             input_times = self.time_mlp(log_snr)
-            mask_logit = head([feat], input_times, target=None)
-            bs, seq_len, num_classes, h_bev, w_bev = mask_logit.shape
+            mask_logit = head(x=mask_t, cond=x, embed_timesteps=input_times, target=None)
+            bs, num_classes, seq_len, h_bev, w_bev = mask_logit.shape
             assert bs == br
             # (bs, len(self.classes), self.seq_length,bev_h, bev_w)
             mask_pred = (mask_logit > self.threshold)
@@ -311,25 +309,24 @@ class DDP_MKV(BEVFusion):
             multi_factor = (torch.arange(self.num_classes, device=device) + 1).view(1, self.num_classes, 1, 1)
             multi_factor = multi_factor.unsqueeze(2)
             multi_factor = multi_factor.repeat(br, 1, self.seq_length, 1, 1)
-            multi_factor = multi_factor.permute(0, 2, 1, 3, 4)  # (bs,seq_length,num_classes,1,1)
-            multi_factor = multi_factor.reshape(br, self.seq_length * self.num_classes, 1, 1)
-
-            mask_pred = mask_pred.view(br, self.seq_length * self.num_classes, h_bev, w_bev)
             mask_pred = mask_pred * multi_factor
+
+            mask_pred = mask_pred.view(bs, self.num_classes * seq_len, h_bev, w_bev)
             mask_pred = resize(mask_pred.float(), size=(h, w), mode="nearest").to(torch.int64)
-            mask_pred = self.embedding_table(mask_pred).view(br, seq_len, self.num_classes, h, w,
+            mask_pred = self.embedding_table(mask_pred).view(br, self.num_classes, seq_len, h, w,
                                                              self.tmp_channels)
-            mask_pred = mask_pred.mean(dim=2).permute(0, 4, 1, 2, 3)
+            mask_pred = mask_pred.mean(dim=1).permute(0, 4, 1, 2, 3).contiguous()
 
             # mask_pred = self.embedding_table(mask_pred).mean(dim=1).permute(0, 3, 1, 2)
             mask_pred = (torch.sigmoid(mask_pred) * 2 - 1) * self.bit_scale
-            mask_pred = mask_pred.reshape(br, seq_len * self.tmp_channels, h, w).contiguous()
+            # mask_pred = mask_pred.reshape(br, seq_len * self.tmp_channels, h, w).contiguous()
 
             pred_noise = (mask_t - alpha * mask_pred) / sigma.clamp(min=1e-8)
             mask_t = mask_pred * alpha_next + pred_noise * sigma_next
             outs.append(mask_logit)
         outs = torch.cat(outs, dim=0)
         logit = outs.mean(dim=0, keepdim=True)
+        logit = logit.permute(0,2,1,3,4).contiguous() # TODO: modify the whole pipeline in the future
         return logit
 
     @torch.no_grad()
@@ -358,7 +355,7 @@ class DDP_MKV(BEVFusion):
             mask_pred = (mask_logit > self.threshold).float()
             multi_factor = (torch.arange(self.num_classes, device=device) + 1).view(1, self.num_classes, 1, 1)
             mask_pred = mask_pred * multi_factor
-            mask_pred = self.embedding_table(mask_pred).mean(dim=1).permute(0, 3, 1, 2)
+            mask_pred = self.embedding_table(mask_pred).mean(dim=1).permute(0, 3, 1, 2).contiguous()
             mask_pred = (torch.sigmoid(mask_pred) * 2 - 1) * self.bit_scale
 
             c = -expm1(log_snr - log_snr_next)

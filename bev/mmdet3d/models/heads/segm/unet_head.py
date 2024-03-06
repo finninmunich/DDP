@@ -1,17 +1,98 @@
-import math
 import functools
+import math
 from operator import mul
+from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn, einsum
-
 from einops import rearrange, repeat, pack, unpack
 from einops.layers.torch import Rearrange
-from .vanilla_attention import Attend
 from mmdet3d.models.builder import HEADS
-
+from torch import nn
+from inspect import isfunction
+from .vanilla_attention import Attend
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if isfunction(d) else d
 # helper functions
+def sigmoid_xent_loss(
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        reduction: str = "mean",
+) -> torch.Tensor:
+    inputs = inputs.float()
+    targets = targets.float()
+    return F.binary_cross_entropy_with_logits(inputs, targets, reduction=reduction)
+
+
+def sigmoid_focal_loss(
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        alpha: float = -1,
+        gamma: float = 2,
+        reduction: str = "mean",
+) -> torch.Tensor:
+    inputs = inputs.float()
+    targets = targets.float()
+    p = torch.sigmoid(inputs)
+    ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    p_t = p * targets + (1 - p) * (1 - targets)
+    loss = ce_loss * ((1 - p_t) ** gamma)
+
+    if alpha >= 0:
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        loss = alpha_t * loss
+
+    if reduction == "mean":
+        loss = loss.mean()
+    elif reduction == "sum":
+        loss = loss.sum()
+    return loss
+
+
+class BEVGridTransform(nn.Module):
+    def __init__(
+            self,
+            *,
+            input_scope: List[Tuple[float, float, float]],
+            output_scope: List[Tuple[float, float, float]],
+            prescale_factor: float = 1,
+    ) -> None:
+        super().__init__()
+        self.input_scope = input_scope
+        self.output_scope = output_scope
+        self.prescale_factor = prescale_factor
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.prescale_factor != 1:
+            x = F.interpolate(
+                x,
+                scale_factor=self.prescale_factor,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        coords = []
+        for (imin, imax, _), (omin, omax, ostep) in zip(
+                self.input_scope, self.output_scope
+        ):
+            v = torch.arange(omin + ostep / 2, omax, ostep)
+            v = (v - imin) / (imax - imin) * 2 - 1
+            coords.append(v.to(x.device))
+
+        u, v = torch.meshgrid(coords, indexing="ij")
+        grid = torch.stack([v, u], dim=-1)
+        grid = torch.stack([grid] * x.shape[0], dim=0)
+
+        x = F.grid_sample(
+            x,
+            grid,
+            mode="bilinear",
+            align_corners=False,
+        )
+        return x
+
 
 def exists(val):
     return val is not None
@@ -194,6 +275,7 @@ class Attention(nn.Module):
     def __init__(
             self,
             dim,
+            cond_dim=None,
             dim_head=64,
             heads=8,
             flash=False,
@@ -207,9 +289,9 @@ class Attention(nn.Module):
         self.attend = Attend(flash=flash, causal=causal)
 
         self.norm = RMSNorm(dim, dim=-1)
-
+        cond_dim = default(cond_dim, dim)
         self.to_q = nn.Linear(dim, inner_dim, bias=False)
-        self.to_kv = nn.Linear(dim, inner_dim * 2, bias=False)
+        self.to_kv = nn.Linear(cond_dim, inner_dim * 2, bias=False)
         self.to_out = nn.Linear(inner_dim, dim, bias=False)
 
         nn.init.zeros_(self.to_out.weight.data)  # identity with skip connection
@@ -217,11 +299,12 @@ class Attention(nn.Module):
     def forward(
             self,
             x,
+            cond=None,
             rel_pos_bias=None
     ):
         x = self.norm(x)  # normalize along the last dimension
-
-        q, k, v = self.to_q(x), *self.to_kv(x).chunk(2, dim=-1)
+        cond = default(cond,x)
+        q, k, v = self.to_q(x), *self.to_kv(cond).chunk(2, dim=-1)
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), (q, k, v))
         # (batch,sequence,(heads*dim_head)) -> (batch,heads,sequence,dim_head)
@@ -277,7 +360,8 @@ class PseudoConv3d(nn.Module):
         if is_video:
             x = rearrange(x, '(b f) c h w -> b c f h w', b=b)
 
-        if not enable_time or not exists(self.temporal_conv):
+        if not enable_time or not exists(self.temporal_conv) or x.shape[2] == 1:
+            # if we only have one frame, or we don't want to set enable_time,then we don't need to apply the temporal conv
             return x
 
         x = rearrange(x, 'b c f h w -> (b h w) c f')
@@ -304,7 +388,9 @@ class SpatioTemporalAttention(nn.Module):
             ff_mult=4,
             pos_bias=True,
             flash=False,
-            causal_time_attn=False
+            causal_time_attn=False,
+            cross_attention=False,
+            cond_dim=None,
     ):
         super().__init__()
         assert not (flash and pos_bias), 'learned positional attention bias is not compatible with flash attention'
@@ -314,7 +400,9 @@ class SpatioTemporalAttention(nn.Module):
 
         self.temporal_attn = Attention(dim=dim, dim_head=dim_head, heads=heads, flash=flash, causal=causal_time_attn)
         self.temporal_rel_pos_bias = ContinuousPositionBias(dim=dim // 2, heads=heads, num_dims=1) if pos_bias else None
-
+        self.cross_attention = cross_attention
+        if self.cross_attention:
+            self.cross_attn = Attention(dim=dim, cond_dim=cond_dim,dim_head=dim_head, heads=heads, flash=flash)
         self.has_feed_forward = add_feed_forward
         if not add_feed_forward:
             return
@@ -324,6 +412,7 @@ class SpatioTemporalAttention(nn.Module):
     def forward(
             self,
             x,
+            cond=None,
             enable_time=True
     ):
         b, c, *_, h, w = x.shape
@@ -338,7 +427,7 @@ class SpatioTemporalAttention(nn.Module):
 
         space_rel_pos_bias = self.spatial_rel_pos_bias(h, w) if exists(self.spatial_rel_pos_bias) else None
 
-        x = self.spatial_attn(x, rel_pos_bias=space_rel_pos_bias) + x
+        x = self.spatial_attn(x=x, cond=None,rel_pos_bias=space_rel_pos_bias) + x
 
         if is_video:
             x = rearrange(x, '(b f) (h w) c -> b c f h w', b=b, h=h, w=w)
@@ -350,10 +439,25 @@ class SpatioTemporalAttention(nn.Module):
 
             time_rel_pos_bias = self.temporal_rel_pos_bias(x.shape[1]) if exists(self.temporal_rel_pos_bias) else None
 
-            x = self.temporal_attn(x, rel_pos_bias=time_rel_pos_bias) + x
+            x = self.temporal_attn(x=x, cond=None,rel_pos_bias=time_rel_pos_bias) + x
 
             x = rearrange(x, '(b h w) f c -> b c f h w', w=w, h=h)
-
+        if self.cross_attention:
+            assert isinstance(cond, torch.Tensor), 'cross attention requires a condition'
+            if is_video:
+                x = rearrange(x, 'b c f h w -> (b f) (h w) c')
+                # first, for spatial attention, f will be treated as the batch dimension, h*w=num_query/key
+            else:
+                x = rearrange(x, 'b c h w -> b (h w) c')
+            cond_resize = rearrange(cond, 'b c h w -> b (h w) c')
+            f = int(x.shape[0]/cond_resize.shape[0])
+            # reshape cond to match the shape of x
+            cond_resize = repeat(cond_resize, 'b n c -> (b f) n c', f=f)
+            x = self.cross_attn(x=x, cond=cond_resize,rel_pos_bias=None) + x
+            if is_video:
+                x = rearrange(x, '(b f) (h w) c -> b c f h w', b=b, h=h, w=w)
+            else:
+                x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
         if self.has_feed_forward:
             x = self.ff(x, enable_time=enable_time) + x
 
@@ -564,11 +668,13 @@ class Upsample(nn.Module):
 class SpaceTimeUnet(nn.Module):
     def __init__(
             self,
-            *,
             dim,
+            classes,
+            loss,
+            grid_transform,
             channels=3,
             dim_mult=(1, 2, 4, 8),
-            self_attns=(False, False, False, True),
+            self_attns=(True, True, True, True),
             temporal_compression=(False, True, True, True),
             resnet_block_depths=(2, 2, 2, 2),
             attn_dim_head=64,
@@ -576,10 +682,22 @@ class SpaceTimeUnet(nn.Module):
             condition_on_timestep=True,
             attn_pos_bias=True,
             flash_attn=False,
-            causal_time_attn=False
+            causal_time_attn=False,
+            receptive_field=1,
+            future_frames=2,
+            cross_attention=True,
+            cond_dim=None,
+            enable_time=False,
+            **kwargs,
     ):
         super().__init__()
         assert len(dim_mult) == len(self_attns) == len(temporal_compression) == len(resnet_block_depths)
+        self.seq_length = receptive_field + future_frames
+        self.classes = classes
+        self.loss = loss
+        self.transform = BEVGridTransform(**grid_transform)
+        self.enable_time = enable_time
+
         num_layers = len(dim_mult)  # number of layer in the unet (half)
 
         dims = [dim, *map(lambda mult: mult * dim, dim_mult)]  # [64, 64, 128, 256, 512]
@@ -611,12 +729,16 @@ class SpaceTimeUnet(nn.Module):
             heads=attn_heads,
             pos_bias=attn_pos_bias,
             flash=flash_attn,
-            causal_time_attn=causal_time_attn
+            causal_time_attn=causal_time_attn,
+            cross_attention=cross_attention,
+            cond_dim=cond_dim,
         )
 
         mid_dim = dims[-1]
 
         self.mid_block1 = ResnetBlock(mid_dim, mid_dim, timestep_cond_dim=timestep_cond_dim)
+        # timestep_cond_dim will be mapped to dim*2 and add to features as a position bias
+        # inside ResNetBlock, features will be processed by PseudoConv3D, then group normalization and SiLU
         self.mid_attn = SpatioTemporalAttention(dim=mid_dim, **attn_kwargs)
         self.mid_block2 = ResnetBlock(mid_dim, mid_dim, timestep_cond_dim=timestep_cond_dim)
 
@@ -646,23 +768,41 @@ class SpaceTimeUnet(nn.Module):
         self.skip_scale = 2 ** -0.5  # paper shows faster convergence
 
         self.conv_in = PseudoConv3d(dim=channels, dim_out=dim, kernel_size=7, temporal_kernel_size=3)
-        self.conv_out = PseudoConv3d(dim=dim, dim_out=channels, kernel_size=3, temporal_kernel_size=3)
+        # from 512 to 64
+        self.conv_out = PseudoConv3d(dim=dim, dim_out=len(classes), kernel_size=3, temporal_kernel_size=3)
+        #64 to 7
 
     def forward(
             self,
             x,
+            cond,
             timestep=None,
-            enable_time=True
+            embed_timesteps=None,
+            target=None,
     ):
+        """
+
+        Args:
+            x: noise gt with shape (bs, channels, frames, bev_h, bev_w)
+            cond: conditional bev features with shape (bs, channels, h, w), h,w is smaller than bev_h, bev_w
+            timestep: embedding of the timestep with shape (bs, timestep_dim)
+            target: ground truth bev segmentation map with shape (bs,num_classes,frames,bev_h,bev_w)
+
+        Returns:
+
+        """
         # TODO: where to put the condition text?
-
         # some asserts
-
-        assert not (exists(self.to_timestep_cond) ^ exists(
-            timestep))  # make sure both timestep and to_timestep_cond are either None or not None
         is_video = x.ndim == 5
+        # resize_x = []
+        # for frame_idx in range(x.size(2)):  # Iterate over the 'frames' dimension
+        #     slice = x[:, :, frame_idx, :, :]
+        #     processed_slice = self.transform(slice)
+        #     resize_x.append(processed_slice)
+        # # Combine the processed frames back into a tensor
+        # x = torch.stack(resize_x, dim=2)  # (bs, channels, frames, h, w)
 
-        if enable_time and is_video:
+        if self.enable_time and is_video:
             frames = x.shape[2]
             assert divisible_by(frames,
                                 self.frame_multiple), f'number of frames on the video ({frames}) must be divisible by the frame multiple ({self.frame_multiple})'
@@ -672,47 +812,78 @@ class SpaceTimeUnet(nn.Module):
                                                                                self.image_size_multiple), f'height and width of the image or video must be a multiple of {self.image_size_multiple}'
 
         # main logic
-
-        t = self.to_timestep_cond(rearrange(timestep, '... -> (...)')) if exists(timestep) else None
-
-        x = self.conv_in(x, enable_time=enable_time)
-
+        if isinstance(embed_timesteps, torch.Tensor):
+            t = embed_timesteps
+        else:
+            t = self.to_timestep_cond(rearrange(timestep, '... -> (...)')) if exists(timestep) else None
+        exapnd_cond = cond.unsqueeze(2).expand(-1, -1, self.seq_length, -1, -1)
+        x = torch.cat((x, exapnd_cond), dim=1)
+        assert self.seq_length== x.size(2)
+        #before feed in self.conv_in, the shape of x is torch.Size([1, 512, 3, 128, 128])
+        x = self.conv_in(x, enable_time=self.enable_time)  # including a 2D in each frame and 1D between each frame
+        # after conv_in the shape of x is torch.Size([1, 64, 3, 128, 128])
+        # x = rearrange(x, 'b c f h w -> b (c f) h w')
+        # x = self.transform(x)
+        # x = rearrange(x, 'b (c f) h w -> b c f h w', f=self.seq_length)
         hiddens = []
 
         for init_block, blocks, maybe_attention, downsample in self.downs:
-            x = init_block(x, t, enable_time=enable_time)
+            x = init_block(x, t, enable_time=self.enable_time)
 
             hiddens.append(x.clone())  # first resnet block
 
             for block in blocks:
-                x = block(x, enable_time=enable_time)  # the rest of the resnet blocks
+                x = block(x, enable_time=self.enable_time)  # the rest of the resnet blocks
 
             if exists(maybe_attention):
-                x = maybe_attention(x, enable_time=enable_time)  # maybe attention
+                x = maybe_attention(x, cond=cond,enable_time=self.enable_time)  # maybe attention
 
             hiddens.append(x.clone())
 
-            x = downsample(x, enable_time=enable_time)
+            x = downsample(x, enable_time=self.enable_time)
+
             # for each layer, we save two tensors for skip-connection
 
-        x = self.mid_block1(x, t, enable_time=enable_time)
-        x = self.mid_attn(x, enable_time=enable_time)
-        x = self.mid_block2(x, t, enable_time=enable_time)
+        x = self.mid_block1(x, t, enable_time=self.enable_time)
+        x = self.mid_attn(x, cond=cond,enable_time=self.enable_time)
+        x = self.mid_block2(x, t, enable_time=self.enable_time)
 
         for init_block, blocks, maybe_attention, upsample in reversed(self.ups):
-            x = upsample(x, enable_time=enable_time)
+            x = upsample(x, enable_time=self.enable_time)
 
             x = torch.cat((hiddens.pop() * self.skip_scale, x), dim=1)
 
-            x = init_block(x, t, enable_time=enable_time)
+            x = init_block(x, t, enable_time=self.enable_time)
 
             x = torch.cat((hiddens.pop() * self.skip_scale, x), dim=1)
 
             for block in blocks:
-                x = block(x, enable_time=enable_time)
+                x = block(x, enable_time=self.enable_time)
 
             if exists(maybe_attention):
-                x = maybe_attention(x, enable_time=enable_time)
+                x = maybe_attention(x, cond=cond,enable_time=self.enable_time)
 
-        x = self.conv_out(x, enable_time=enable_time)
-        return x
+        x = rearrange(x, 'b c f h w -> b (c f) h w')
+        x = self.transform(x)
+        x = rearrange(x, 'b (c f) h w -> b c f h w', f=self.seq_length)
+        x = self.conv_out(x, enable_time=self.enable_time)
+        if self.training:
+            losses = {}
+            assert x.shape == target.shape
+            x = x.permute(0, 2, 1, 3, 4).contiguous()
+            target = target.permute(0, 2, 1, 3, 4).contiguous()
+            # x = x.view(bs, self.seq_length, len(self.classes), bev_h, bev_w)
+            # target = target.view(bs, self.seq_length, len(self.classes), bev_h, bev_w)
+            for timesteps in range(self.seq_length):
+                for index, name in enumerate(self.classes):
+                    if self.loss == "xent":
+                        loss = sigmoid_xent_loss(x[:, timesteps, index], target[:, timesteps, index])
+                    elif self.loss == "focal":
+                        loss = sigmoid_focal_loss(x[:, timesteps, index], target[:, timesteps, index])
+                    else:
+                        raise ValueError(f"unsupported loss: {self.loss}")
+                    losses[f"class: {name}/timesteps: {timesteps}/loss: {self.loss}"] = loss
+            return losses
+        else:
+            #x = x.permute(0, 2, 1, 3, 4).contiguous()
+            return torch.sigmoid(x)
