@@ -39,7 +39,7 @@ data:
     receptive_field: ${receptive_field}
     future_frames: ${future_frames}
     camera_index: ${camera_index}
-    visualization: finn-0307-1
+    visualization: finn-0307-3
     #filter_invalid_sample: true
 
   test:
@@ -56,7 +56,7 @@ data:
     receptive_field: ${receptive_field}
     future_frames: ${future_frames}
     camera_index: ${camera_index}
-    visualization: finn-0307-1
+    visualization: finn-0307-3
     #filter_invalid_sample: true
 evaluation:
   interval: 1
@@ -144,6 +144,9 @@ model:
   heads:
     map:
       type: SpaceTimeUnet
+      grid_transform:
+        input_scope: [ [ -51.2, 51.2, 0.4 ], [ -51.2, 51.2, 0.4 ] ]
+        output_scope: [ [ -50, 50, 0.5 ], [ -50, 50, 0.5 ] ]
       enable_time: false
       dim: 64 # latent dimensions
       channels: 512 #input dimension (noise 256 + cond 256)

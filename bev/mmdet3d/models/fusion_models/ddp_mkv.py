@@ -310,8 +310,10 @@ class DDP_MKV(BEVFusion):
             multi_factor = multi_factor.unsqueeze(2)
             multi_factor = multi_factor.repeat(br, 1, self.seq_length, 1, 1)
             mask_pred = mask_pred * multi_factor
-
-            mask_pred = mask_pred.view(bs, self.num_classes * seq_len, h_bev, w_bev)
+            try:
+                mask_pred = mask_pred.view(bs, self.num_classes * seq_len, h_bev, w_bev)
+            except:
+                mask_pred = mask_pred.reshape(bs, self.num_classes * seq_len, h_bev, w_bev)
             mask_pred = resize(mask_pred.float(), size=(h, w), mode="nearest").to(torch.int64)
             mask_pred = self.embedding_table(mask_pred).view(br, self.num_classes, seq_len, h, w,
                                                              self.tmp_channels)

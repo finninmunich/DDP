@@ -11,6 +11,7 @@ from mmdet3d.models.builder import HEADS
 from torch import nn
 from inspect import isfunction
 from .vanilla_attention import Attend
+from ....ops.norm import resize
 def default(val, d):
     if exists(val):
         return val
@@ -769,6 +770,7 @@ class SpaceTimeUnet(nn.Module):
 
         self.conv_in = PseudoConv3d(dim=channels, dim_out=dim, kernel_size=7, temporal_kernel_size=3)
         # from 512 to 64
+        self.final_upsample = Upsample(dim, upsample_space=True, upsample_time=False)
         self.conv_out = PseudoConv3d(dim=dim, dim_out=len(classes), kernel_size=3, temporal_kernel_size=3)
         #64 to 7
 
@@ -863,10 +865,19 @@ class SpaceTimeUnet(nn.Module):
             if exists(maybe_attention):
                 x = maybe_attention(x, cond=cond,enable_time=self.enable_time)
 
+        # previous method, use BEVGridTransform to transform from 128 -> 200
+        # x = rearrange(x, 'b c f h w -> b (c f) h w')
+        # x = self.transform(x)
+        # x = rearrange(x, 'b (c f) h w -> b c f h w', f=self.seq_length)
+
+        # current method, use Upsample to transform from 128 -> 256,
+        # then use BEVGridTransform to transform from 256 -> 200
+        x = self.final_upsample(x, enable_time=self.enable_time)
         x = rearrange(x, 'b c f h w -> b (c f) h w')
         x = self.transform(x)
         x = rearrange(x, 'b (c f) h w -> b c f h w', f=self.seq_length)
         x = self.conv_out(x, enable_time=self.enable_time)
+
         if self.training:
             losses = {}
             assert x.shape == target.shape
